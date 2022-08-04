@@ -1,0 +1,218 @@
+---
+title: "DBMS Practicum 2"
+author: "Sakthi Kripa Selvan (selvan.sa@northeastern.edu), Srikanth Kadaba Bhogananda (kadababhogananda.s@northeastern.edu)"
+date: "05/03/2021"
+output:
+  html_document:
+    df_print: paged
+  pdf_document: default
+  html_notebook: default
+---
+
+# Part 2
+
+#### Loading the required library
+
+```{r libraries, message=FALSE}
+library(RMySQL)
+library(RSQLite)
+library(DBI)
+library(sqldf)
+library(ggplot2)
+db_user <- 'admin'
+db_password <- 'sakthi123'
+db_name <- 'practicum2db'
+db_host <- 'practicum2db.cozotp8befyg.us-east-1.rds.amazonaws.com'
+db_port <- 3306
+```
+
+
+#### Establishing connection with the MySQL database.
+
+```{r}
+mydb <-  dbConnect(MySQL(), user = db_user, password = db_password,
+                  dbname = db_name, host = db_host, port = db_port)
+```
+
+```{r}
+detach("package:RMySQL")
+library(sqldf)
+```
+
+Connecting with the SQLite database to connect with the db created in Part1
+
+```{r}
+fpath = "./"
+file = "pubmed.db"
+con <- dbConnect(RSQLite::SQLite(), paste0(fpath, file))
+```
+
+#### Preparation of data for authorFact table
+
+Using the tables in Part 1 to create a authorFacts table as requested. This table has data in the level of auid (i.e) auid is the primary key for the table. It also has the author name, the number of publications by the author and the average publications per year by the author. 
+
+```{r}
+sqlCmd = "SELECT au.auid, 
+                 (au.FirstName ||' '|| au.LastName ||' '|| Initials) as authorName,
+                 COUNT(*) as TotalPublications,
+                 ROUND(((COUNT(*)*1.0)/(SELECT COUNT(DISTINCT PublishYear) as CalcField 
+                       FROM Journals)),2) as AveragePublications
+          FROM Authors au
+          JOIN authorArticleMap map on map.auid = au.auid
+          JOIN Articles ar on map.PMID = ar.PMID
+          GROUP BY au.auid, (au.FirstName ||' '|| au.LastName ||' '|| Initials)"
+
+authorFacts_df = dbGetQuery(con, sqlCmd)
+head(authorFacts_df)
+```
+
+#### Fact table creation in MySQL
+
+For this part of the practicum, a single fact table is created with all the attributes asked for, eliminating the need for dimension table. 
+
+```{sql connection=mydb}
+DROP TABLE IF EXISTS authorFacts;
+```
+
+```{sql connection=mydb}
+CREATE TABLE authorFacts(
+auid INT NOT NULL,
+authorName VARCHAR(255),
+TotalPublications INT,
+AveragePublications FLOAT,
+PRIMARY KEY (auid)
+)
+```
+
+#### Loading data into the table
+
+```{r}
+# dbWriteTable is used with append to insert the data from data frame into table.
+dbWriteTable(mydb, 'authorFacts', authorFacts_df, row.names=F,append=T, overwrite=F)
+```
+
+#### Display the first few rows
+
+```{sql connection=mydb}
+SELECT * FROM authorFacts
+       LIMIT 5;
+```
+
+# Part 3
+
+#### Top 10 Authors by number of publications
+The following query into the fact table fetches the top 10 authors by the number of publications. 
+```{r}
+topAuthorsdf <- dbGetQuery(mydb, statement = paste("SELECT authorName, TotalPublications
+                                                FROM authorFacts
+                                                ORDER BY TotalPublications DESC, authorName
+                                                LIMIT 10"))
+topAuthorsdf
+```
+No updates are required to the fact table to accommodate the above query.
+
+#### Seasonal Patterns in number of publications
+
+To observe the seasonal patterns in the number of publications, we need to include information on publish year and month into the authorFacts table. After this update, auid, publishyear and publishmonth together are the primary keys for this table. Below is the SQL query used to get the columns required. 
+
+```{r}
+sqlCmd = "SELECT au.auid, 
+                 (au.FirstName ||' '|| au.LastName ||' '|| Initials) as authorName,
+                  CAST (PublishYear AS CHAR) PublishYear,
+                 PublishMonth,
+                 COUNT(*) as TotalPublications,
+                 ROUND(((COUNT(*)*1.0)/(SELECT COUNT(DISTINCT PublishYear) as CalcField 
+                       FROM Journals)),2) as AveragePublications
+          FROM Authors au
+          JOIN authorArticleMap map on map.auid = au.auid
+          JOIN Articles ar on map.PMID = ar.PMID
+          JOIN Journals j on j.ISSN = ar.ISSN
+          GROUP BY au.auid, (au.FirstName ||' '|| au.LastName ||' '|| Initials), PublishYear,
+                   PublishMonth"
+
+authorFactsUpd_df = dbGetQuery(con, sqlCmd)
+head(authorFactsUpd_df)
+```
+
+#### Creating the authorFactsUpd table 
+
+```{sql connection=mydb}
+DROP TABLE IF EXISTS authorFactsUpd;
+```
+
+```{sql connection=mydb}
+CREATE TABLE authorFactsUpd(
+auid INT NOT NULL,
+authorName VARCHAR(255),
+PublishYear VARCHAR(255) NOT NULL,
+PublishMonth INT NOT NULL,
+TotalPublications INT,
+AveragePublications FLOAT,
+PRIMARY KEY (auid, PublishYear, PublishMonth)
+)
+```
+
+#### Loading data into the table
+
+```{r}
+# dbWriteTable is used with append to insert the data from data frame into table.
+dbWriteTable(mydb, 'authorFactsUpd', authorFactsUpd_df, row.names=F,append=T, overwrite=F)
+```
+
+#### Display the first few rows of the table
+
+```{sql connection=mydb}
+SELECT * FROM authorFactsUpd
+       LIMIT 5;
+```
+
+#### Quarterly trends
+
+Using the month column to get the quarter in which the article was published. 
+
+```{r}
+quarterdf <- dbGetQuery(mydb, statement = paste("WITH CTE AS 
+            (SELECT *, CASE WHEN PublishMonth <= 3 THEN '1' 
+            WHEN PublishMonth >= 4 AND PublishMonth <= 6 THEN '2' 
+            WHEN PublishMonth >= 7 AND PublishMonth <= 9 THEN '3' 
+            WHEN PublishMonth >= 10 THEN '4' 
+            END AS Quarter
+            FROM authorFactsUpd
+            ORDER BY 1)
+            SELECT DISTINCT Quarter, SUM(TotalPublications) OVER(PARTITION BY Quarter) as        
+            PublicationsPerQuarter FROM CTE
+            ORDER BY 1
+            "))
+quarterdf
+```
+
+```{r}
+ggplot(quarterdf, aes(x=Quarter, y=PublicationsPerQuarter, group = 1)) +
+  geom_line(color="#69b3a2", size=1) +
+  ggtitle("Number of journals published per quarter") +
+geom_text(aes(label=PublicationsPerQuarter), vjust=-.5)
+```
+
+The highest number of journals published is during the 4th quarter. Publications seem to reduce during the second and third quarter and increase in the final quarter.
+
+#### Yearly trends
+
+Using the updated authorFacts table to get the number of articles published per year 
+
+```{r}
+yeardf <- dbGetQuery(mydb, statement = paste("SELECT DISTINCT PublishYear Year, 
+      SUM(TotalPublications) OVER(PARTITION BY PublishYear)as PublicationsPeryear
+FROM authorFactsUpd
+ORDER BY 1"))
+yeardf
+```
+
+
+```{r}
+ggplot(yeardf, aes(x=Year, y=PublicationsPeryear, group = 1)) +
+  geom_line(color="#69b3a2", size=1) +
+  ggtitle("Number of journals published per year") +
+geom_text(aes(label=PublicationsPeryear), vjust=-.5)
+```
+
+Most journals were published during the year of 2012. A sharp decline in the number of publications is observed from 2012 to 2013.
